@@ -126,7 +126,6 @@ async def authorize(host, port, token, status_updates_queue, watchdog_queue):
     answer_line_2 = await readline(reader)
     json_answer = json.loads(answer_line_1)
     if json_answer is None:
-        await asyncio.sleep(10)
         raise InvalidTokenException()
     watchdog_queue.put_nowait('Authorization done')
     return reader, writer, json_answer
