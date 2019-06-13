@@ -1,3 +1,4 @@
+import config
 import asyncio
 import async_timeout
 import aionursery
@@ -11,16 +12,6 @@ import concurrent
 import socket
 from tkinter import messagebox
 import contextlib
-
-
-DEFAULT_HOST = 'minechat.dvmn.org'
-DEFAULT_LISTENER_PORT = 5000
-DEFAULT_SENDER_PORT = 5050
-HISTORY_FILE_PATH = 'history'
-TOKEN = '2a4ae2ae-820f-11e9-8154-0242ac110002'
-TIMEOUT = 1
-RETRY_CONNECTION_DELAY = 3
-RETRIES_WITHOUT_DELAY = 2
 
 
 class InvalidTokenException(Exception):
@@ -62,8 +53,8 @@ def validate_token(token):
 async def retry_connection(host, port,
                            status_updates_queue=None,
                            connection_change_class=None,
-                           delay=RETRY_CONNECTION_DELAY,
-                           tries_without_delay=RETRIES_WITHOUT_DELAY):
+                           delay=config.RETRY_CONNECTION_DELAY,
+                           tries_without_delay=config.RETRIES_WITHOUT_DELAY):
     failed_tries_count = 0
     update_status = (status_updates_queue is not None and
                      connection_change_class is not None)
@@ -131,7 +122,7 @@ async def authorize(host, port, token, status_updates_queue, watchdog_queue):
     return reader, writer, json_answer
 
 
-async def send_message(reader, writer, message, timeout=TIMEOUT):
+async def send_message(reader, writer, message, timeout=config.TIMEOUT):
     await writeline(writer, message)
     if message:
         await writeline(writer, '')
@@ -140,21 +131,33 @@ async def send_message(reader, writer, message, timeout=TIMEOUT):
     return answer
 
 
-async def send_msgs(reader, writer,  sending_queue, watchdog_queue):
+async def send_msgs(reader, writer,  sending_queue, watchdog_queue, lock):
     while True:
         message = await sending_queue.get()
-        answer = await send_message(reader, writer, message)
+        async with lock:
+            answer = await send_message(reader, writer, message)
         watchdog_queue.put_nowait('Message sent')
 
 
-async def authorize_and_send_msgs(host, port, token, sending_queue, status_updates_queue, watchdog_queue):
+async def ping(reader, writer, interval, watchdog_queue, lock):
+    while True:
+        await asyncio.sleep(interval)
+        async with lock:
+            answer = await send_message(reader, writer, '')
+        watchdog_queue.put_nowait('Ping message')
+
+
+async def authorize_and_send_msgs(host, port, token, sending_queue, status_updates_queue, watchdog_queue, ping_interval):
     reader, writer, json_answer = await authorize(host, port, token, status_updates_queue, watchdog_queue)
     nickname_update = gui.NicknameReceived(json_answer['nickname'])
     status_updates_queue.put_nowait(nickname_update)
-    await send_msgs(reader, writer, sending_queue, watchdog_queue)
+    sender_lock = asyncio.Lock()
+    async with create_handy_nursery() as nursery:
+        nursery.start_soon(send_msgs(reader, writer, sending_queue, watchdog_queue, sender_lock))
+        nursery.start_soon(ping(reader, writer, ping_interval, watchdog_queue, sender_lock))
 
 
-async def watch_for_connection(watchdog_queue, logger, timeout=TIMEOUT):
+async def watch_for_connection(watchdog_queue, logger, timeout=config.TIMEOUT):
     while True:
         try:
             async with async_timeout.timeout(timeout) as cm:
@@ -171,28 +174,26 @@ async def watch_for_connection(watchdog_queue, logger, timeout=TIMEOUT):
             raise ConnectionError()
 
 
-async def handle_connection(host, listener_port, sender_port, token, messages_queue, file_queue, sending_queue, status_updates_queue, watchdog_queue, watchdog_logger):
+async def handle_connection(host, listener_port, sender_port, token,
+                            messages_queue, file_queue, sending_queue,
+                            status_updates_queue, watchdog_queue,
+                            watchdog_logger, ping_interval):
     while True:
         try:
             async with create_handy_nursery() as nursery:
-                nursery.start_soon(
-                    generate_msgs(host, listener_port, messages_queue,
-                                  file_queue, status_updates_queue,
-                                  watchdog_queue)
-                )
-                nursery.start_soon(
-                    authorize_and_send_msgs(host, sender_port, token, sending_queue,
-                                        status_updates_queue, watchdog_queue)
-                )
-                nursery.start_soon(
-                    watch_for_connection(watchdog_queue, watchdog_logger)
-                )
-        except ConnectionError as e:
+                nursery.start_soon(generate_msgs(host, listener_port, messages_queue,
+                              file_queue, status_updates_queue,
+                              watchdog_queue))
+                nursery.start_soon(authorize_and_send_msgs(host, sender_port, token, sending_queue,
+                                    status_updates_queue, watchdog_queue, ping_interval))
+                nursery.start_soon(watch_for_connection(watchdog_queue, watchdog_logger))
+        except ConnectionError:
             pass
+        else:
+            break
 
 
 async def main():
-    logging.basicConfig(level=logging.DEBUG)
     messages_queue = asyncio.Queue()
     sending_queue = asyncio.Queue()
     status_updates_queue = asyncio.Queue()
@@ -200,10 +201,30 @@ async def main():
     watchdog_queue = asyncio.Queue()
     watchdog_logger = logging.getLogger('watchdog')
     try:
-        await asyncio.gather(
-            handle_connection(DEFAULT_HOST, DEFAULT_LISTENER_PORT, DEFAULT_SENDER_PORT, TOKEN, messages_queue, file_queue, sending_queue, status_updates_queue, watchdog_queue, watchdog_logger),
-            gui.draw(messages_queue, sending_queue, status_updates_queue),
-            save_messages(HISTORY_FILE_PATH, file_queue),
+        with open(config.TOKEN_FILE_PATH, 'r') as f:
+            token = f.readline()
+    except FileNotFoundError:
+        messagebox.showerror('Зарегистрируйтесь',
+                             'Нужно зарегистрироваться')
+    try:
+        async with create_handy_nursery() as nursery:
+            nursery.start_soon(
+                handle_connection(host=config.DEFAULT_HOST,
+                                  listener_port=config.DEFAULT_LISTENER_PORT,
+                                  sender_port=config.DEFAULT_SENDER_PORT,
+                                  token=token,
+                                  messages_queue=messages_queue,
+                                  file_queue=file_queue,
+                                  sending_queue=sending_queue,
+                                  status_updates_queue=status_updates_queue,
+                                  watchdog_queue=watchdog_queue,
+                                  watchdog_logger=watchdog_logger,
+                                  ping_interval=config.PING_INTERVAL)
+            )
+            nursery.start_soon(
+                gui.draw(messages_queue, sending_queue, status_updates_queue)
+            )
+            nursery.start_soon(save_messages(config.HISTORY_FILE_PATH, file_queue)
         )
     except InvalidTokenException:
         messagebox.showerror('Неверный токен', 'Проверьте токен, сервер его не узнал')
